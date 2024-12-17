@@ -6,6 +6,9 @@ const youtube = google.youtube({
   auth: process.env.YOUTUBE_API_KEY
 })
 
+// Add some debug logging
+console.log('API Key available:', !!process.env.YOUTUBE_API_KEY)
+
 // Extract playlist ID from URL
 function getPlaylistId(url: string) {
   // Handle various playlist URL formats

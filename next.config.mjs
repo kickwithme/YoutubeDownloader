@@ -21,6 +21,9 @@ const nextConfig = {
     parallelServerBuildTraces: true,
     parallelServerCompiles: true,
   },
+  env: {
+    YOUTUBE_API_KEY: process.env.YOUTUBE_API_KEY,
+  },
 }
 
 mergeConfig(nextConfig, userConfig)
