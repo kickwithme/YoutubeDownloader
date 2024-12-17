@@ -4,3 +4,5 @@ downloads/
 venv/
 .env.local
 .env.*.local
+*.pyc
+__pycache__/

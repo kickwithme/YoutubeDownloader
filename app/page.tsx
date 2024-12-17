@@ -1,13 +1,12 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
-import { Download, Search, Loader2 } from 'lucide-react'
+import { Download, Search, Loader2, List, Play, Pause, Square } from 'lucide-react'
 import { toast } from 'sonner'
-import { AudioTest } from "@/components/AudioTest"
 
 type VideoResult = {
   id: string
@@ -20,25 +19,88 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<VideoResult[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
   const [downloadingId, setDownloadingId] = useState<string | null>(null)
   const [downloadProgress, setDownloadProgress] = useState(0)
   const [downloadFilename, setDownloadFilename] = useState('')
+  const [isDownloading, setIsDownloading] = useState(false)
+  const [shouldStop, setShouldStop] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
+
+  // Add a ref to store the abort controller
+  const abortControllerRef = useRef<AbortController | null>(null)
+
+  const progressRef = useRef<number>(0)
+
+  // Add a new ref for the reader
+  const readerRef = useRef<ReadableStreamDefaultReader | null>(null)
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return
 
     setIsLoading(true)
+    setSearchError(null)
     try {
       const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`)
-      if (!response.ok) throw new Error('Search failed')
-      const results = await response.json()
-      setSearchResults(results)
+      const data = await response.json()
+
+      if (!response.ok) {
+        let errorMessage = data.details || data.error || 'Search failed'
+        
+        // Show specific messages for playlist errors
+        if (data.type === 'PLAYLIST_ACCESS_ERROR') {
+          setSearchError('This playlist is private or not accessible')
+          toast.error('Playlist Error', {
+            description: 'Make sure the playlist is public and try again.'
+          })
+        } else if (data.type === 'PLAYLIST_NOT_FOUND') {
+          setSearchError('Playlist not found - The URL might be invalid or the playlist was deleted')
+          toast.error('Playlist Error', {
+            description: 'The playlist might have been deleted or the URL is invalid.'
+          })
+        } else {
+          setSearchError(errorMessage)
+          toast.error('Search failed', {
+            description: errorMessage
+          })
+        }
+        
+        throw new Error(errorMessage)
+      }
+
+      setSearchResults(data)
+      setSearchError(null)
     } catch (err) {
-      toast.error('Failed to search YouTube. Please try again.')
-      console.error(err)
+      console.error('Search error:', err)
     } finally {
       setIsLoading(false)
     }
+  }
+
+  const handleDownloadAll = async () => {
+    setIsDownloading(true)
+    setShouldStop(false)
+
+    for (const video of searchResults) {
+      if (shouldStop) break
+
+      while (isPaused) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        if (shouldStop) break
+      }
+
+      try {
+        await handleDownload(video)
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      } catch (err) {
+        console.error(`Failed to download ${video.title}:`, err)
+      }
+    }
+
+    setIsDownloading(false)
+    setShouldStop(false)
+    setIsPaused(false)
+    toast.success('All downloads completed!')
   }
 
   const handleDownload = async (video: VideoResult) => {
@@ -46,58 +108,95 @@ export default function Home() {
     setDownloadProgress(0)
     setDownloadFilename('')
 
+    const controller = new AbortController()
+    const signal = controller.signal
+
     try {
-      const response = await fetch(`/api/download?videoId=${video.id}`)
-      if (!response.ok) throw new Error('Download failed')
+      let response;
+      try {
+        response = await fetch(`/api/download?videoId=${video.id}`, {
+          signal
+        })
+      } catch (fetchError) {
+        // Handle network errors
+        if (signal.aborted) {
+          throw new Error('cancelled')
+        }
+        throw new Error('Network error - Please check your connection')
+      }
+
+      // Handle HTTP errors
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        if (signal.aborted) {
+          throw new Error('cancelled')
+        }
+        throw new Error(errorData.details || errorData.error || 'Download failed')
+      }
 
       const reader = response.body?.getReader()
       if (!reader) throw new Error('Unable to read response')
 
-      let totalSize = 0
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+      // Store references for cleanup
+      abortControllerRef.current = controller
+      readerRef.current = reader
 
-        const text = new TextDecoder().decode(value)
-        const lines = text.split('\n')
+      while (!signal.aborted) {
+        try {
+          const { done, value } = await reader.read()
+          if (done) break
 
-        for (const line of lines) {
-          if (line.startsWith('filename:')) {
-            setDownloadFilename(line.slice(9))
-          } else if (line.startsWith('totalSize:')) {
-            totalSize = parseFloat(line.slice(10))
-          } else if (line.startsWith('progress:')) {
-            const [, current, total] = line.split(':')
-            const progress = (parseFloat(current) / parseFloat(total)) * 100
-            setDownloadProgress(progress)
-          } else if (line === 'completed') {
-            toast.success('Download completed!')
-            break
-          } else if (line.startsWith('error:')) {
-            throw new Error(line.slice(6))
+          const text = new TextDecoder().decode(value)
+          const lines = text.split('\n')
+
+          for (const line of lines) {
+            if (signal.aborted) break
+
+            try {
+              if (line.trim()) {
+                const data = JSON.parse(line)
+                if (data.type === 'progress') {
+                  setDownloadProgress(data.percentage)
+                  setDownloadFilename(
+                    `${data.percentage.toFixed(1)}% ${data.speed ? `at ${data.speed}` : ''} ${data.eta ? `(ETA: ${data.eta})` : ''}`
+                  )
+                }
+              }
+            } catch (e) {
+              console.log('Non-JSON output:', line)
+            }
           }
+        } catch (readError) {
+          if (signal.aborted) {
+            throw new Error('cancelled')
+          }
+          throw readError
         }
       }
 
-      // Trigger download
-      const downloadResponse = await fetch(`/api/download?videoId=${video.id}`)
-      const blob = await downloadResponse.blob()
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = downloadFilename || `${video.title}.mp3`
-      document.body.appendChild(a)
-      a.click()
-      window.URL.revokeObjectURL(url)
-      document.body.removeChild(a)
-
     } catch (err) {
       console.error('Download error:', err)
-      toast.error(`Failed to download: ${err instanceof Error ? err.message : 'Unknown error'}`)
+      if (err.name === 'AbortError' || err.message === 'cancelled' || signal.aborted) {
+        toast.info('Download cancelled')
+      } else {
+        toast.error(`Failed to download: ${err instanceof Error ? err.message : 'Unknown error'}`)
+      }
     } finally {
+      // Clean up
+      if (readerRef.current) {
+        try {
+          await readerRef.current.cancel()
+        } catch (e) {
+          console.error('Error cancelling reader:', e)
+        }
+        readerRef.current = null
+      }
+
+      // Reset states
       setDownloadingId(null)
       setDownloadProgress(0)
       setDownloadFilename('')
+      abortControllerRef.current = null
     }
   }
 
@@ -115,27 +214,123 @@ export default function Home() {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`
   }
 
+  const stopDownloads = async () => {
+    if (downloadingId) {
+      try {
+        // First, tell the server to stop the download
+        await fetch(`/api/download?videoId=${downloadingId}&action=cancel`)
+
+        // Then cancel the reader
+        if (readerRef.current) {
+          await readerRef.current.cancel()
+          readerRef.current = null
+        }
+
+        // Finally abort the controller
+        if (abortControllerRef.current) {
+          try {
+            abortControllerRef.current.abort()
+          } catch (e) {
+            console.error('Error aborting controller:', e)
+          }
+          abortControllerRef.current = null
+        }
+      } catch (err) {
+        console.error('Failed to cancel download:', err)
+      }
+    }
+
+    // Reset all states
+    setShouldStop(true)
+    setIsDownloading(false)
+    setIsPaused(false)
+    setDownloadingId(null)
+    setDownloadProgress(0)
+    setDownloadFilename('')
+    toast.info('Downloads stopped')
+  }
+
+  const togglePause = () => {
+    setIsPaused(!isPaused)
+    toast.info(isPaused ? 'Downloads resumed' : 'Downloads paused')
+  }
+
   return (
     <main className="container mx-auto p-4 space-y-8">
       <div className="max-w-3xl mx-auto">
         <h1 className="text-2xl font-bold text-center mb-6">YouTube Downloader</h1>
-        <div className="flex gap-2 mb-6">
-          <Input
-            type="text"
-            placeholder="Search for a video..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
-            className="flex-grow"
-          />
-          <Button onClick={handleSearch} disabled={isLoading}>
-            {isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Search className="h-4 w-4" />
+        
+        <div className="flex flex-col gap-4 mb-6">
+          <div className="flex flex-col gap-2">
+            <div className="flex gap-2">
+              <Input
+                type="text"
+                placeholder="Search for a video or paste URL..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
+                className="flex-grow"
+              />
+              <Button onClick={handleSearch} disabled={isLoading}>
+                {isLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Search className="h-4 w-4" />
+                )}
+                <span className="ml-2">Search</span>
+              </Button>
+            </div>
+
+            {searchError && (
+              <div className="bg-destructive/15 text-destructive text-sm px-3 py-2 rounded-md">
+                {searchError}
+              </div>
             )}
-            <span className="ml-2">Search</span>
-          </Button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {searchResults.length > 0 && !isDownloading && (
+              <Button 
+                onClick={handleDownloadAll}
+                disabled={downloadingId !== null}
+                size="sm"
+              >
+                <Download className="h-4 w-4 mr-2" />
+                Download All
+              </Button>
+            )}
+
+            {isDownloading && (
+              <>
+                <Button 
+                  onClick={togglePause}
+                  size="sm"
+                  variant={isPaused ? "outline" : "secondary"}
+                >
+                  {isPaused ? (
+                    <>
+                      <Play className="h-4 w-4 mr-2" />
+                      Resume
+                    </>
+                  ) : (
+                    <>
+                      <Pause className="h-4 w-4 mr-2" />
+                      Pause
+                    </>
+                  )}
+                </Button>
+
+                <Button 
+                  onClick={stopDownloads}
+                  size="sm"
+                  variant="destructive"
+                >
+                  <Square className="h-4 w-4 mr-2" />
+                  Stop
+                </Button>
+              </>
+            )}
+          </div>
         </div>
 
         <div className="space-y-4">
@@ -151,11 +346,18 @@ export default function Home() {
                   <h2 className="font-semibold truncate">{video.title}</h2>
                   <p className="text-sm text-gray-500">{formatDuration(video.duration)}</p>
                   {downloadingId === video.id && (
-                    <div className="mt-2">
-                      <Progress value={downloadProgress} className="w-full" />
-                      <p className="text-sm text-gray-500 mt-1">
-                        {downloadProgress.toFixed(1)}% - {downloadFilename}
-                      </p>
+                    <div className="mt-2 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Progress value={downloadProgress} className="flex-grow" />
+                        <span className="text-sm text-muted-foreground whitespace-nowrap">
+                          {downloadProgress.toFixed(1)}%
+                        </span>
+                      </div>
+                      {downloadFilename && (
+                        <p className="text-sm text-muted-foreground">
+                          {downloadFilename}
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>
@@ -180,10 +382,6 @@ export default function Home() {
             </Card>
           ))}
         </div>
-      </div>
-
-      <div className="mt-8">
-        <AudioTest />
       </div>
     </main>
   )
